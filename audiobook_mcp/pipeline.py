@@ -370,6 +370,16 @@ class Pipeline:
             in_flight: dict = {}
             next_idx = 0
             while next_idx < len(pending) or in_flight:
+                # Once budget runs out this inner loop stops handing out new
+                # work, but every future already in in_flight still has to
+                # be awaited below before this call can return -- an ffmpeg
+                # subprocess can't be safely killed mid-encode without
+                # risking a corrupt or duplicate-written segment file on the
+                # next resume. Because up to `workers` segments run truly
+                # concurrently (separate OS processes), the wall-clock
+                # overrun this can add is bounded by whichever one of them
+                # is slowest -- not their sum -- the same single-segment
+                # bound the original one-at-a-time version already had.
                 while (next_idx < len(pending) and len(in_flight) < workers
                        and (time.monotonic() - t0) < budget):
                     seg = pending[next_idx]

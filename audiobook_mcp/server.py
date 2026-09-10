@@ -312,11 +312,16 @@ async def audiobook_run_until_done(params: m.RunUntilDoneInput, ctx: Context) ->
                 status = await asyncio.to_thread(pipeline.run, budget, lambda msg: ctx.info(msg))
                 chunk_dt = time.monotonic() - t_chunk
                 chunks_run += 1
+                # Report the whole-job fraction, not elapsed/max_total_seconds --
+                # a client that reads the numeric progress/total (rather than
+                # parsing the message string) would otherwise see 100% at the
+                # end of every call just because its own time cap was reached,
+                # even when the conversion itself is nowhere near done.
+                call_elapsed = round(elapsed + chunk_dt, 1)
                 await ctx.report_progress(
-                    progress=min(elapsed + chunk_dt, params.max_total_seconds),
-                    total=params.max_total_seconds,
+                    progress=status["overall_progress"], total=1.0,
                     message=f"{status['status_line']} "
-                            f"(overall job: {status['overall_progress_pct']}% done)",
+                            f"(elapsed {call_elapsed}s/{params.max_total_seconds}s this call)",
                 )
                 if chunk_dt < 0.05 or chunks_run >= 2000:
                     # stage did essentially no work (shouldn't normally

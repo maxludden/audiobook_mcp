@@ -78,6 +78,13 @@ def _get_json(url: str, timeout: float = 15.0) -> dict:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.URLError as e:
         raise MetadataLookupError(f"Request to {url.split('?')[0]} failed: {e}") from e
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        # A source occasionally answers 200 with something that isn't
+        # valid JSON (an HTML error/maintenance page, truncated body,
+        # unexpected encoding). Wrap it the same way as a network failure
+        # so every caller of this helper -- including _query_one_source's
+        # "never raises" contract -- only has one exception type to catch.
+        raise MetadataLookupError(f"Request to {url.split('?')[0]} returned unparseable data: {e}") from e
 
 
 def query_google_books(title: str, author: str | None, api_key: str | None) -> list:
