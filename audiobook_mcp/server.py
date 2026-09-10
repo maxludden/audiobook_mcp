@@ -250,6 +250,9 @@ async def audiobook_continue_conversion(params: m.ContinueConversionInput, ctx: 
             status = await asyncio.to_thread(
                 pipeline.run, params.time_budget_seconds, lambda msg: ctx.info(msg)
             )
+        await ctx.report_progress(
+            progress=status["overall_progress"], total=1.0, message=status["status_line"],
+        )
         return json.dumps(status, indent=2, ensure_ascii=False)
     except Exception as e:
         return _error(e)
@@ -312,7 +315,8 @@ async def audiobook_run_until_done(params: m.RunUntilDoneInput, ctx: Context) ->
                 await ctx.report_progress(
                     progress=min(elapsed + chunk_dt, params.max_total_seconds),
                     total=params.max_total_seconds,
-                    message=status["status_line"],
+                    message=f"{status['status_line']} "
+                            f"(overall job: {status['overall_progress_pct']}% done)",
                 )
                 if chunk_dt < 0.05 or chunks_run >= 2000:
                     # stage did essentially no work (shouldn't normally
@@ -350,6 +354,13 @@ async def audiobook_get_status(params: m.JobIdInput) -> str:
           "stage": str,          # "extract"|"align"|"encode"|"assemble"|"deliver"|"done"
           "done": bool,
           "status_line": str,     # most recent human-readable progress line
+          "overall_progress": float,      # 0.0-1.0 across the WHOLE job, comparable
+                                            # across separate continue_conversion/
+                                            # run_until_done calls -- suitable for a
+                                            # progress bar. Weighted by each stage's
+                                            # typical share of total time (encode
+                                            # dominates), not just "stages done / 6".
+          "overall_progress_pct": float,  # overall_progress * 100, rounded to 1 decimal
           "book": {"title", "author", "series", "series_index",
                     "chapter_count", "cover_found"} | null,
           "alignment": {          # present once alignment has started
