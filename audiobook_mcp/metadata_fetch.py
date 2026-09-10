@@ -45,7 +45,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Callable, Optional
+from collections.abc import Callable
 
 USER_AGENT = "audiobook-mcp/0.1 (personal research tool; https://github.com/)"
 MIN_INTERVAL_SECONDS = 1.5  # soft per-process throttle across all lookup calls
@@ -79,7 +79,7 @@ def _get_json(url: str, timeout: float = 15.0) -> dict:
         raise MetadataLookupError(f"Request to {url.split('?')[0]} failed: {e}") from e
 
 
-def query_google_books(title: str, author: Optional[str], api_key: Optional[str]) -> list:
+def query_google_books(title: str, author: str | None, api_key: str | None) -> list:
     q = f"intitle:{title}"
     if author:
         q += f"+inauthor:{author}"
@@ -96,7 +96,7 @@ OL_FIELDS = (
 )
 
 
-def query_open_library(title: str, author: Optional[str]) -> list:
+def query_open_library(title: str, author: str | None) -> list:
     # Explicit `fields=` matters: the default response omits
     # ratings_average/ratings_count/number_of_pages_median entirely.
     params = {"title": title, "limit": 20, "fields": OL_FIELDS}
@@ -106,7 +106,7 @@ def query_open_library(title: str, author: Optional[str]) -> list:
     return _get_json(url).get("docs", [])
 
 
-def query_audible(title: str, author: Optional[str]) -> list:
+def query_audible(title: str, author: str | None) -> list:
     keywords = title if not author else f"{title} {author}"
     params = {
         "keywords": keywords, "num_results": 20,
@@ -116,7 +116,7 @@ def query_audible(title: str, author: Optional[str]) -> list:
     return _get_json(url).get("products", [])
 
 
-def query_apple(title: str, author: Optional[str], entity: str = "audiobook") -> list:
+def query_apple(title: str, author: str | None, entity: str = "audiobook") -> list:
     term = title if not author else f"{title} {author}"
     params = {"term": term, "entity": entity, "limit": 25}
     url = "https://itunes.apple.com/search?" + urllib.parse.urlencode(params)
@@ -143,12 +143,12 @@ def upsize_apple_artwork(artwork_url: str, size: int = 2400) -> str:
 # --------------------------------------------------------------- matching
 
 
-def _norm(s: Optional[str]) -> str:
+def _norm(s: str | None) -> str:
     """Lowercase, strip punctuation/extra whitespace -- for loose title matching."""
     return re.sub(r"[^a-z0-9 ]", "", (s or "").lower()).strip()
 
 
-def _volume_of(title: Optional[str]) -> Optional[int]:
+def _volume_of(title: str | None) -> int | None:
     """Extract a trailing volume number from a series title, if present.
     'Defiance of the Fall 12 (Unabridged)' -> 12 ; 'Project Hail Mary' -> None
     """
@@ -156,8 +156,8 @@ def _volume_of(title: Optional[str]) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def pick_best(results: list, title: str, key_title: Callable, key_date: Optional[Callable] = None,
-              current_year: int = 2026) -> Optional[dict]:
+def pick_best(results: list, title: str, key_title: Callable, key_date: Callable | None = None,
+              current_year: int = 2026) -> dict | None:
     """Choose the entry whose title best matches the query.
 
     Search APIs rank by relevance, NOT by series volume -- an unfiltered
@@ -217,7 +217,7 @@ def probe_image(url: str, timeout: float = 20.0) -> dict:
     return {"url": url, "width": w, "height": h, "bytes": len(blob), "_data": blob}
 
 
-def _decode_dimensions(blob: bytes) -> tuple[Optional[int], Optional[int]]:
+def _decode_dimensions(blob: bytes) -> tuple[int | None, int | None]:
     w = h = None
     if blob[:2] == b"\xff\xd8":
         i = 2
@@ -358,9 +358,9 @@ def reconcile(out: dict, title: str) -> dict:
 # ------------------------------------------------------------- entry point
 
 
-def lookup_book_metadata(title: str, author: Optional[str], sources: list[str],
+def lookup_book_metadata(title: str, author: str | None, sources: list[str],
                           reconcile_results: bool, include_covers: bool,
-                          google_api_key: Optional[str]) -> dict:
+                          google_api_key: str | None) -> dict:
     """Query the requested sources, optionally reconcile into one record
     and/or probe cover candidates for real pixel dimensions. This is the
     one function server.py's tool calls -- everything above is a helper.

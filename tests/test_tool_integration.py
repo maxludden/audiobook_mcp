@@ -1,15 +1,11 @@
-#!/usr/bin/env python3
 """
 Exercises the actual audiobook_fetch_cover_image / audiobook_embed_cover_metadata
 MCP tool functions (Pydantic validation -> async wrapper -> real file I/O),
 using a file:// URL so no live internet is needed (urllib.request handles
 file:// natively, so this is the real download_to_file() code path, not a
 mock). audiobook_lookup_book_metadata itself needs live internet to the
-four source APIs (blocked in this sandbox -- see test_metadata_fetch.py's
-module docstring) and isn't exercised here.
-
-Run:
-    python3 tests/test_tool_integration.py
+four source APIs and isn't exercised here (see test_metadata_fetch.py's
+module docstring).
 """
 from __future__ import annotations
 
@@ -17,16 +13,15 @@ import asyncio
 import json
 import shutil
 import subprocess
-import sys
-import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import pytest
 
-from audiobook_mcp import server, models as m  # noqa: E402
+from audiobook_mcp import models as m
+from audiobook_mcp import server
 
 
-async def run(tmp_path: Path) -> None:
+async def _run(tmp_path: Path) -> None:
     # Build a real small JPEG to serve as the "cover" being fetched.
     src_img = tmp_path / "source.jpg"
     subprocess.run(
@@ -41,7 +36,6 @@ async def run(tmp_path: Path) -> None:
         cover_url=file_url, out_dir=str(out_dir), title="Project Hail Mary!", author="Andy Weir",
     ))
     fetch_data = json.loads(fetch_result)
-    print("fetch_cover_image ->", fetch_data)
     assert "error" not in fetch_data, fetch_data
     dest = Path(fetch_data["path"])
     assert dest.name == "Project-Hail-Mary_Andy-Weir.jpg", dest
@@ -53,11 +47,9 @@ async def run(tmp_path: Path) -> None:
         cover_url=file_url, out_dir=str(out_dir), title="Project Hail Mary!", author="Andy Weir",
     )))
     assert "error" in refetch, refetch
-    print("duplicate fetch correctly refused ->", refetch["error"][:60], "...")
 
     if shutil.which("exiftool") is None:
-        print("SKIP embed step: exiftool not on PATH")
-        return
+        pytest.skip("exiftool not on PATH")
 
     embed_result = json.loads(await server.audiobook_embed_cover_metadata(m.EmbedCoverMetadataInput(
         image_path=str(dest),
@@ -67,7 +59,6 @@ async def run(tmp_path: Path) -> None:
             average_rating=4.49, length="16h 10m",
         ),
     )))
-    print("embed_cover_metadata ->", embed_result)
     assert "error" not in embed_result, embed_result
     assert embed_result["dry_run"] is False
 
@@ -79,11 +70,7 @@ async def run(tmp_path: Path) -> None:
     assert lines[0] == "Project Hail Mary", lines
     comment = json.loads(lines[1])
     assert comment["narrators"] == ["Ray Porter"], comment
-    print("readback confirmed:", lines[0], comment["narrators"])
-
-    print("\nALL TOOL-INTEGRATION TESTS PASSED")
 
 
-if __name__ == "__main__":
-    with tempfile.TemporaryDirectory() as td:
-        asyncio.run(run(Path(td)))
+def test_fetch_and_embed_cover(tmp_path: Path) -> None:
+    asyncio.run(_run(tmp_path))

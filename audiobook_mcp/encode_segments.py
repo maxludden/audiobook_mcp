@@ -10,7 +10,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .audio_probe import FfmpegNotFoundError, AudioProbeError
+from .audio_probe import AudioProbeError, FfmpegNotFoundError
 
 
 def safe_name(n: int, title: str) -> str:

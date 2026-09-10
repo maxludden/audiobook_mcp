@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -29,7 +28,16 @@ class StartConversionInput(BaseModel):
     epub_path: str = Field(
         ..., min_length=1,
         description="Absolute path to the matching .epub for the same book. Used for chapter "
-                    "titles, word-count sanity checks, and cover art."
+                    "titles and word-count sanity checks, and (unless cover_image_path is given) "
+                    "for cover art too."
+    )
+    cover_image_path: str | None = Field(
+        default=None,
+        description="Absolute path to a .jpg/.jpeg/.png image to use as the M4B's cover art "
+                    "instead of whatever (if anything) is embedded in the EPUB -- typically the "
+                    "output of audiobook_fetch_cover_image after audiobook_lookup_book_metadata. "
+                    "Only takes effect when the job is created (or restarted with "
+                    "force_restart=True), same as every other option here."
     )
     out_dir: str = Field(
         ..., min_length=1,
@@ -121,7 +129,7 @@ class ListConversionsInput(BaseModel):
     """Input for listing known jobs."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    out_dir: Optional[str] = Field(
+    out_dir: str | None = Field(
         default=None, description="If set, only list jobs whose output directory matches exactly."
     )
     limit: int = Field(default=20, ge=1, le=100, description="Maximum jobs to return.")
@@ -164,7 +172,7 @@ class RenderWaveformInput(BaseModel):
         description="Half-width of the rendered window (seconds) centered on the chapter's "
                     "current recorded boundary."
     )
-    center_override_seconds: Optional[float] = Field(
+    center_override_seconds: float | None = Field(
         default=None, ge=0.0,
         description="Render around this timestamp instead of the chapter's recorded boundary -- "
                     "useful after audiobook_inspect_chapter_boundary surfaces a candidate gap you "
@@ -189,12 +197,12 @@ class VerifyOutputInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     m4b_path: str = Field(..., min_length=1, description="Absolute path to the .m4b file to verify.")
-    source_audio_path: Optional[str] = Field(
+    source_audio_path: str | None = Field(
         default=None,
         description="Absolute path to the original source .mp3/.m4a, if available, so total "
                     "duration can be cross-checked against it."
     )
-    expected_chapter_count: Optional[int] = Field(
+    expected_chapter_count: int | None = Field(
         default=None, ge=1,
         description="If known, the chapter count to compare against (e.g. from "
                     "audiobook_inspect_epub, +1 per detected intro/outro)."
@@ -237,7 +245,7 @@ class LookupBookMetadataInput(BaseModel):
                     "(e.g. 'Defiance of the Fall 6', not just the series name) -- otherwise "
                     "a relevance-ranked search can hand back the wrong volume."
     )
-    author: Optional[str] = Field(
+    author: str | None = Field(
         default=None, max_length=200,
         description="Author name, if known. Helps disambiguate common titles."
     )
@@ -258,7 +266,7 @@ class LookupBookMetadataInput(BaseModel):
                     "pixel dimensions (never trust a URL's size token -- some CDNs silently "
                     "clamp to a small cached master)."
     )
-    google_api_key: Optional[str] = Field(
+    google_api_key: str | None = Field(
         default=None,
         description="Overrides the GOOGLE_BOOKS_API_KEY environment variable. Google Books' "
                     "anonymous quota is shared globally and usually returns HTTP 429 without "
@@ -276,7 +284,7 @@ class FetchCoverImageInput(BaseModel):
     out_dir: str = Field(..., min_length=1, description="Directory to save the image into.")
     title: str = Field(..., min_length=1, max_length=300,
                         description="Book title, used to build the saved filename.")
-    author: Optional[str] = Field(default=None, max_length=200,
+    author: str | None = Field(default=None, max_length=200,
                                    description="Author, used to build the saved filename, if known.")
     overwrite: bool = Field(
         default=False,
@@ -291,18 +299,20 @@ class BookMetadataInput(BaseModel):
     optional -- pass through whatever you have."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    title: Optional[str] = Field(default=None, max_length=300)
-    authors: Optional[list[str]] = Field(default=None, max_length=20)
-    narrators: Optional[list[str]] = Field(default=None, max_length=20)
-    description: Optional[str] = Field(default=None, max_length=5000)
-    publisher: Optional[str] = Field(default=None, max_length=200)
-    copyright: Optional[str] = Field(default=None, max_length=300)
-    published_date: Optional[str] = Field(default=None, max_length=20, description="e.g. 'YYYY-MM-DD' or 'YYYY'.")
-    categories: Optional[list[str]] = Field(default=None, max_length=20)
-    source_url: Optional[str] = Field(default=None, max_length=500)
-    average_rating: Optional[float] = Field(default=None, ge=0, le=5)
-    ratings_count: Optional[int] = Field(default=None, ge=0)
-    length: Optional[str] = Field(default=None, max_length=50, description="e.g. '16h 10m' or '412 pages'.")
+    title: str | None = Field(default=None, max_length=300)
+    authors: list[str] | None = Field(default=None, max_length=20)
+    narrators: list[str] | None = Field(default=None, max_length=20)
+    description: str | None = Field(default=None, max_length=5000)
+    publisher: str | None = Field(default=None, max_length=200)
+    copyright: str | None = Field(default=None, max_length=300)
+    published_date: str | None = Field(
+        default=None, max_length=20, description="e.g. 'YYYY-MM-DD' or 'YYYY'."
+    )
+    categories: list[str] | None = Field(default=None, max_length=20)
+    source_url: str | None = Field(default=None, max_length=500)
+    average_rating: float | None = Field(default=None, ge=0, le=5)
+    ratings_count: int | None = Field(default=None, ge=0)
+    length: str | None = Field(default=None, max_length=50, description="e.g. '16h 10m' or '412 pages'.")
 
 
 class EmbedCoverMetadataInput(BaseModel):

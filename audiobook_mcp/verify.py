@@ -8,9 +8,8 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import Optional
 
-from .audio_probe import FfmpegNotFoundError, AudioProbeError, ffprobe_duration
+from .audio_probe import AudioProbeError, FfmpegNotFoundError, ffprobe_duration
 
 
 def _ffprobe_json(path: Path) -> dict:
@@ -37,8 +36,8 @@ def _ffprobe_json(path: Path) -> dict:
         raise AudioProbeError(f"ffprobe returned unparseable output for {path}") from e
 
 
-def verify_m4b(m4b_path: Path, source_audio_path: Optional[Path],
-               expected_chapter_count: Optional[int]) -> dict:
+def verify_m4b(m4b_path: Path, source_audio_path: Path | None,
+               expected_chapter_count: int | None) -> dict:
     data = _ffprobe_json(m4b_path)
     fmt = data.get("format", {})
     chapters = data.get("chapters", [])

@@ -5,7 +5,7 @@ description = "MCP server that converts a single-file MP3/M4A audiobook + EPUB i
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.28,<2.0.0",
+    "mcp>=2.0,<3.0.0",
     "pydantic>=2.0,<3.0.0",
     "beautifulsoup4>=4.12,<5.0.0",
     "lxml>=5.0,<6.0.0",
@@ -16,9 +16,31 @@ dependencies = [
 [project.scripts]
 audiobook-mcp = "audiobook_mcp.server:main"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0,<9.0",
+    "ruff>=0.6,<1.0",
+    "mypy>=1.10,<2.0",
+]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["audiobook_mcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = ["third_party"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true

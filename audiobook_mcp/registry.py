@@ -22,7 +22,6 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
 
 _HOME = Path(os.environ.get("AUDIOBOOK_MCP_HOME", Path.home() / ".audiobook_mcp"))
 _REGISTRY_PATH = _HOME / "registry.json"
@@ -95,7 +94,7 @@ class Registry:
             )
         return rec
 
-    def list(self, out_dir: Optional[Path] = None, limit: int = 20, offset: int = 0) -> dict:
+    def list(self, out_dir: Path | None = None, limit: int = 20, offset: int = 0) -> dict:
         with _lock:
             data = self._read()
         items = [

@@ -15,21 +15,18 @@ fixtures are built from the shapes described there. Before relying on
 this in production, also run a handful of real lookups
 (audiobook_lookup_book_metadata) somewhere with network access to the
 four APIs.
-
-Run:
-    python3 tests/test_metadata_fetch.py
 """
 from __future__ import annotations
 
 import json
-import sys
-import tempfile
+import shutil
+import subprocess
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import pytest
 
-from audiobook_mcp import metadata_fetch as mf  # noqa: E402
-from audiobook_mcp import cover_embed  # noqa: E402
+from audiobook_mcp import cover_embed
+from audiobook_mcp import metadata_fetch as mf
 
 
 def test_pick_best_prefers_exact_title_match():
@@ -131,12 +128,8 @@ def test_build_exiftool_args_includes_comment_json_and_narrator():
 def test_embed_metadata_end_to_end_with_real_exiftool(tmp_path: Path):
     """Exercises the actual exiftool subprocess call (not just build_exiftool_args),
     against a real minimal JPEG, and reads the tags back."""
-    import shutil
-    import subprocess
-
     if shutil.which("exiftool") is None:
-        print("SKIP test_embed_metadata_end_to_end_with_real_exiftool: exiftool not on PATH")
-        return
+        pytest.skip("exiftool not on PATH")
 
     # Smallest valid JPEG: 1x1 pixel, generated fresh rather than
     # hardcoding bytes that might not decode identically everywhere.
@@ -166,18 +159,3 @@ def test_embed_metadata_end_to_end_with_real_exiftool(tmp_path: Path):
     assert lines[2] == "Audible Studios", lines
     comment = json.loads(lines[3])
     assert comment["narrators"] == ["Ray Porter"], comment
-
-
-def main() -> None:
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    with tempfile.TemporaryDirectory() as td:
-        for t in tests:
-            import inspect
-            kwargs = {"tmp_path": Path(td)} if "tmp_path" in inspect.signature(t).parameters else {}
-            t(**kwargs)
-            print(f"PASS {t.__name__}")
-    print(f"\nALL {len(tests)} METADATA-FETCH TESTS PASSED")
-
-
-if __name__ == "__main__":
-    main()

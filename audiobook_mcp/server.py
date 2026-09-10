@@ -23,20 +23,23 @@ import os
 import time
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP, Context, Image
+from mcp.server.mcpserver import Context, Image, MCPServer
+from mcp.types import ToolAnnotations
 
+from . import cover_embed, metadata_fetch
+from . import models as m
 from .audio_probe import (
-    AudioProbeError, FfmpegNotFoundError, detect_silences, render_waveform_png,
+    AudioProbeError,
+    FfmpegNotFoundError,
+    detect_silences,
+    render_waveform_png,
 )
-from .epub_extract import extract_epub, EpubExtractError
+from .epub_extract import EpubExtractError, extract_epub
 from .pipeline import Pipeline, PipelineConfig, PipelineError
 from .registry import Registry, RegistryError
 from .verify import verify_m4b
-from . import metadata_fetch
-from . import cover_embed
-from . import models as m
 
-mcp = FastMCP("audiobook_mcp")
+mcp = MCPServer("audiobook_mcp")
 _registry = Registry()
 _job_locks: dict[str, asyncio.Lock] = {}
 
@@ -68,11 +71,11 @@ def _pipeline_for(job_id: str) -> Pipeline:
 # --------------------------------------------------------------------------- inspect_epub
 @mcp.tool(
     name="audiobook_inspect_epub",
-    annotations={
-        "title": "Preview an EPUB's chapters and metadata",
-        "readOnlyHint": True, "destructiveHint": False,
-        "idempotentHint": True, "openWorldHint": False,
-    },
+    title="Preview an EPUB's chapters and metadata",
+    annotations=ToolAnnotations(
+        read_only_hint=True, destructive_hint=False,
+        idempotent_hint=True, open_world_hint=False,
+    ),
 )
 async def audiobook_inspect_epub(params: m.InspectEpubInput) -> str:
     """Parse an EPUB and preview the book metadata, chapter list, and cover
@@ -128,11 +131,11 @@ async def audiobook_inspect_epub(params: m.InspectEpubInput) -> str:
 # ----------------------------------------------------------------------- start_conversion
 @mcp.tool(
     name="audiobook_start_conversion",
-    annotations={
-        "title": "Start (or resume) an audiobook -> M4B conversion job",
-        "readOnlyHint": False, "destructiveHint": False,
-        "idempotentHint": True, "openWorldHint": False,
-    },
+    title="Start (or resume) an audiobook -> M4B conversion job",
+    annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=False,
+        idempotent_hint=True, open_world_hint=False,
+    ),
 )
 async def audiobook_start_conversion(params: m.StartConversionInput, ctx: Context) -> str:
     """Create a resumable conversion job for one MP3/M4A audiobook + its
@@ -149,6 +152,9 @@ async def audiobook_start_conversion(params: m.StartConversionInput, ctx: Contex
         params (StartConversionInput): see field descriptions. Notably:
             - mp3_path/epub_path (str): source files, must both exist.
             - out_dir (str): where the finished .m4b will be written.
+            - cover_image_path (Optional[str]): use this image instead of
+              the EPUB's own cover. Typical flow: audiobook_lookup_book_metadata
+              -> audiobook_fetch_cover_image -> pass the downloaded path here.
             - detect_intro/detect_outro (bool): off by default; only turn
               on if the user has confirmed the book has an audible
               intro/outro segment (see tool description in code for why).
@@ -171,7 +177,8 @@ async def audiobook_start_conversion(params: m.StartConversionInput, ctx: Contex
     """
     try:
         mp3, epub, out_dir = Path(params.mp3_path), Path(params.epub_path), Path(params.out_dir)
-        PipelineConfig.validate_new(mp3, epub, out_dir)
+        cover_override = Path(params.cover_image_path) if params.cover_image_path else None
+        PipelineConfig.validate_new(mp3, epub, out_dir, cover_override=cover_override)
 
         job_id, work_dir = _registry.create_job(mp3=mp3, epub=epub, out_dir=out_dir,
                                                   title_hint=epub.stem)
@@ -184,7 +191,7 @@ async def audiobook_start_conversion(params: m.StartConversionInput, ctx: Contex
             intro_title=params.intro_title, outro_title=params.outro_title,
             outro_max_search=params.outro_max_search, detect_intro=params.detect_intro,
             intro_max_len=params.intro_max_len, detect_outro=params.detect_outro,
-            outro_max_tail=params.outro_max_tail,
+            outro_max_tail=params.outro_max_tail, cover_override=cover_override,
         )
         pipeline = Pipeline(config, work_dir)
 
@@ -205,11 +212,11 @@ async def audiobook_start_conversion(params: m.StartConversionInput, ctx: Contex
 # -------------------------------------------------------------------- continue_conversion
 @mcp.tool(
     name="audiobook_continue_conversion",
-    annotations={
-        "title": "Advance a conversion job by one bounded chunk of work",
-        "readOnlyHint": False, "destructiveHint": False,
-        "idempotentHint": False, "openWorldHint": False,
-    },
+    title="Advance a conversion job by one bounded chunk of work",
+    annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=False,
+        idempotent_hint=False, open_world_hint=False,
+    ),
 )
 async def audiobook_continue_conversion(params: m.ContinueConversionInput, ctx: Context) -> str:
     """Do up to time_budget_seconds of work on a job (aligning chapters,
@@ -251,11 +258,11 @@ async def audiobook_continue_conversion(params: m.ContinueConversionInput, ctx: 
 # ---------------------------------------------------------------------------- run_until_done
 @mcp.tool(
     name="audiobook_run_until_done",
-    annotations={
-        "title": "Loop a conversion job forward until it finishes or a time cap is hit",
-        "readOnlyHint": False, "destructiveHint": False,
-        "idempotentHint": False, "openWorldHint": False,
-    },
+    title="Loop a conversion job forward until it finishes or a time cap is hit",
+    annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=False,
+        idempotent_hint=False, open_world_hint=False,
+    ),
 )
 async def audiobook_run_until_done(params: m.RunUntilDoneInput, ctx: Context) -> str:
     """Repeatedly advance a job in chunk_seconds increments, reporting
@@ -321,11 +328,11 @@ async def audiobook_run_until_done(params: m.RunUntilDoneInput, ctx: Context) ->
 # ------------------------------------------------------------------------------- get_status
 @mcp.tool(
     name="audiobook_get_status",
-    annotations={
-        "title": "Read a conversion job's current status",
-        "readOnlyHint": True, "destructiveHint": False,
-        "idempotentHint": True, "openWorldHint": False,
-    },
+    title="Read a conversion job's current status",
+    annotations=ToolAnnotations(
+        read_only_hint=True, destructive_hint=False,
+        idempotent_hint=True, open_world_hint=False,
+    ),
 )
 async def audiobook_get_status(params: m.JobIdInput) -> str:
     """Read a job's current progress WITHOUT doing any work -- safe to
@@ -379,11 +386,11 @@ async def audiobook_get_status(params: m.JobIdInput) -> str:
 # --------------------------------------------------------------------------- list_conversions
 @mcp.tool(
     name="audiobook_list_conversions",
-    annotations={
-        "title": "List known conversion jobs",
-        "readOnlyHint": True, "destructiveHint": False,
-        "idempotentHint": True, "openWorldHint": False,
-    },
+    title="List known conversion jobs",
+    annotations=ToolAnnotations(
+        read_only_hint=True, destructive_hint=False,
+        idempotent_hint=True, open_world_hint=False,
+    ),
 )
 async def audiobook_list_conversions(params: m.ListConversionsInput) -> str:
     """List jobs known to this server (persisted at
@@ -416,11 +423,11 @@ async def audiobook_list_conversions(params: m.ListConversionsInput) -> str:
 # ---------------------------------------------------------------- inspect_chapter_boundary
 @mcp.tool(
     name="audiobook_inspect_chapter_boundary",
-    annotations={
-        "title": "List silence gaps found around a chapter's recorded boundary",
-        "readOnlyHint": True, "destructiveHint": False,
-        "idempotentHint": True, "openWorldHint": False,
-    },
+    title="List silence gaps found around a chapter's recorded boundary",
+    annotations=ToolAnnotations(
+        read_only_hint=True, destructive_hint=False,
+        idempotent_hint=True, open_world_hint=False,
+    ),
 )
 async def audiobook_inspect_chapter_boundary(params: m.InspectBoundaryInput) -> str:
     """Re-scan the audio around a chapter's currently recorded boundary
@@ -492,11 +499,11 @@ async def audiobook_inspect_chapter_boundary(params: m.InspectBoundaryInput) -> 
 # ------------------------------------------------------------- render_boundary_waveform
 @mcp.tool(
     name="audiobook_render_boundary_waveform",
-    annotations={
-        "title": "Render a waveform image around a chapter boundary",
-        "readOnlyHint": False, "destructiveHint": False,
-        "idempotentHint": True, "openWorldHint": False,
-    },
+    title="Render a waveform image around a chapter boundary",
+    annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=False,
+        idempotent_hint=True, open_world_hint=False,
+    ),
 )
 async def audiobook_render_boundary_waveform(params: m.RenderWaveformInput) -> Image:
     """Render a PNG waveform snapshot centered on a chapter's current
@@ -543,11 +550,11 @@ async def audiobook_render_boundary_waveform(params: m.RenderWaveformInput) -> I
 # ------------------------------------------------------------------- patch_chapter_boundary
 @mcp.tool(
     name="audiobook_patch_chapter_boundary",
-    annotations={
-        "title": "Manually override a chapter's detected boundary",
-        "readOnlyHint": False, "destructiveHint": True,
-        "idempotentHint": False, "openWorldHint": False,
-    },
+    title="Manually override a chapter's detected boundary",
+    annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=True,
+        idempotent_hint=False, open_world_hint=False,
+    ),
 )
 async def audiobook_patch_chapter_boundary(params: m.PatchBoundaryInput, ctx: Context) -> str:
     """Manually fix a chapter boundary that landed in the wrong place
@@ -590,11 +597,11 @@ async def audiobook_patch_chapter_boundary(params: m.PatchBoundaryInput, ctx: Co
 # ------------------------------------------------------------------------------ verify_output
 @mcp.tool(
     name="audiobook_verify_output",
-    annotations={
-        "title": "Sanity-check a finished M4B",
-        "readOnlyHint": True, "destructiveHint": False,
-        "idempotentHint": True, "openWorldHint": False,
-    },
+    title="Sanity-check a finished M4B",
+    annotations=ToolAnnotations(
+        read_only_hint=True, destructive_hint=False,
+        idempotent_hint=True, open_world_hint=False,
+    ),
 )
 async def audiobook_verify_output(params: m.VerifyOutputInput) -> str:
     """Run the same checks the skill recommends before handing a result
@@ -637,11 +644,11 @@ async def audiobook_verify_output(params: m.VerifyOutputInput) -> str:
 # --------------------------------------------------------------------------- cancel_conversion
 @mcp.tool(
     name="audiobook_cancel_conversion",
-    annotations={
-        "title": "Remove a conversion job",
-        "readOnlyHint": False, "destructiveHint": True,
-        "idempotentHint": True, "openWorldHint": False,
-    },
+    title="Remove a conversion job",
+    annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=True,
+        idempotent_hint=True, open_world_hint=False,
+    ),
 )
 async def audiobook_cancel_conversion(params: m.CancelConversionInput) -> str:
     """Remove a job from the registry. By default this only forgets the
@@ -676,11 +683,11 @@ async def audiobook_cancel_conversion(params: m.CancelConversionInput) -> str:
 # -------------------------------------------------------------------- lookup_book_metadata
 @mcp.tool(
     name="audiobook_lookup_book_metadata",
-    annotations={
-        "title": "Look up book/audiobook metadata and cover art candidates",
-        "readOnlyHint": True, "destructiveHint": False,
-        "idempotentHint": True, "openWorldHint": True,
-    },
+    title="Look up book/audiobook metadata and cover art candidates",
+    annotations=ToolAnnotations(
+        read_only_hint=True, destructive_hint=False,
+        idempotent_hint=True, open_world_hint=True,
+    ),
 )
 async def audiobook_lookup_book_metadata(params: m.LookupBookMetadataInput) -> str:
     """Look up book/audiobook metadata (authors, narrators, publisher,
@@ -757,11 +764,11 @@ async def audiobook_lookup_book_metadata(params: m.LookupBookMetadataInput) -> s
 # ----------------------------------------------------------------------- fetch_cover_image
 @mcp.tool(
     name="audiobook_fetch_cover_image",
-    annotations={
-        "title": "Download a cover image URL to disk",
-        "readOnlyHint": False, "destructiveHint": False,
-        "idempotentHint": False, "openWorldHint": True,
-    },
+    title="Download a cover image URL to disk",
+    annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=False,
+        idempotent_hint=False, open_world_hint=True,
+    ),
 )
 async def audiobook_fetch_cover_image(params: m.FetchCoverImageInput) -> str:
     """Download a specific cover image URL (typically one from
@@ -809,11 +816,11 @@ async def audiobook_fetch_cover_image(params: m.FetchCoverImageInput) -> str:
 # ------------------------------------------------------------------- embed_cover_metadata
 @mcp.tool(
     name="audiobook_embed_cover_metadata",
-    annotations={
-        "title": "Embed a metadata record into a cover image's EXIF/XMP/IPTC tags",
-        "readOnlyHint": False, "destructiveHint": True,
-        "idempotentHint": True, "openWorldHint": False,
-    },
+    title="Embed a metadata record into a cover image's EXIF/XMP/IPTC tags",
+    annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=True,
+        idempotent_hint=True, open_world_hint=False,
+    ),
 )
 async def audiobook_embed_cover_metadata(params: m.EmbedCoverMetadataInput) -> str:
     """Write a book metadata record into an existing image file's

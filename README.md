@@ -41,11 +41,13 @@ pip install -e .
 # or: pip install -r requirements.txt
 ```
 
-This server targets **v1.x of the MCP Python SDK** (`mcp>=1.28,<2.0.0`),
-which is the SDK's own currently-recommended version for production use.
-v2 renamed `FastMCP` to `MCPServer` and changed parts of the API; migrating
-this server to v2 would mean updating `audiobook_mcp/server.py`'s imports
-and re-verifying the `Context`/`Image` APIs used there.
+This server targets **v2.x of the MCP Python SDK** (`mcp>=2.0,<3.0.0`).
+v2 renamed `FastMCP` to `MCPServer` (now imported from
+`mcp.server.mcpserver`, along with `Context`/`Image`) and changed the
+`@mcp.tool()` decorator's `annotations` parameter from a plain dict to a
+`mcp.types.ToolAnnotations` object, with `title` moving out to become the
+decorator's own `title=` kwarg. `Context.report_progress()`/`.info()` and
+the `Image` class kept the same call shape.
 
 ### Register with an MCP client
 
@@ -100,7 +102,7 @@ Typical flow: `start_conversion` → loop `run_until_done` (or
 find the right cut, then `patch_chapter_boundary` and resume → finally
 `verify_output` on the result.
 
-The last three tools are a separate, independent workflow (ported from
+The last three tools are a mostly-independent workflow (ported from
 the `book-metadata-fetch` skill, see `third_party/book-metadata-fetch/`
 for the original and `evaluations/README.md`-adjacent test coverage in
 `tests/test_metadata_fetch.py`): `lookup_book_metadata` (by title/author,
@@ -110,7 +112,10 @@ pixel dimensions → `embed_cover_metadata` on the downloaded file. Same
 guardrails as the source skill: personal research/cataloging use, no
 Amazon/Audible page scraping (that needs a browser tool this server
 doesn't have -- Tier 1 here is the ceiling), never loop it over long
-title lists.
+title lists. The one bridge between the two workflows: pass
+`fetch_cover_image`'s downloaded path as `start_conversion`'s
+`cover_image_path` to use a fetched cover instead of whatever (if
+anything) is in the source EPUB.
 
 ## Jobs, state, and where things live
 
@@ -137,17 +142,13 @@ can't cause command injection.
 ## Testing
 
 ```bash
-python3 -m py_compile audiobook_mcp/*.py
-
-python3 evaluations/make_fixture.py --out-dir /tmp/audiobook_fixture
-python3 tests/test_smoke.py /tmp/audiobook_fixture
-
-python3 tests/test_metadata_fetch.py       # reconciliation/ranking logic, real exiftool embed
-python3 tests/test_tool_integration.py     # fetch/embed MCP tools end-to-end via file:// URL
+uv sync --group dev
+uv run pytest -v
 ```
 
-`make_fixture.py` synthesizes a tiny 4-chapter "book" (EPUB + a ~40s MP3
-built from distinct tones and real silence gaps, including one
+`tests/conftest.py`'s session-scoped `fixture_dir` fixture calls
+`evaluations/make_fixture.py` to synthesize a tiny 4-chapter "book" (EPUB +
+a ~40s MP3 built from distinct tones and real silence gaps, including one
 deliberately-placed decoy gap) so the full pipeline — alignment, decoy
 filtering, encoding, muxing, cover embedding, delivery — can be exercised
 in seconds without a real audiobook. `test_smoke.py` runs the actual
@@ -190,9 +191,3 @@ and why it's built the way it is.
   the source skill's Tier 2 procedure manually, subject to the same
   guardrails (never bypass a CAPTCHA/sign-in wall, one on-demand lookup
   per title).
-- **No integration between fetched cover art and the M4B pipeline
-  itself yet** — `audiobook_embed_cover_metadata` tags a standalone
-  image file; it doesn't currently feed into
-  `audiobook_start_conversion`'s cover selection (which still only uses
-  whatever's in the source EPUB). A natural follow-up would be an
-  optional cover-image override on `start_conversion`.

@@ -27,9 +27,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from evaluations.make_fixture import build_epub, build_audio  # noqa: E402
 from audiobook_mcp.pipeline import Pipeline, PipelineConfig  # noqa: E402
 from audiobook_mcp.registry import Registry  # noqa: E402
+from evaluations.make_fixture import build_audio, build_epub  # noqa: E402
 
 EVAL_SOURCE_DIR = Path("/tmp/audiobook_mcp_eval/source")
 EVAL_OUT_DIR = Path("/tmp/audiobook_mcp_eval/out")

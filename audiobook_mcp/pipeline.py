@@ -44,20 +44,22 @@ import re
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
 
 from .audio_probe import (
-    check_ffmpeg_available, detect_silences, ffprobe_duration,
+    check_ffmpeg_available,
+    detect_silences,
+    ffprobe_duration,
 )
-from .encode_segments import safe_name, encode_one
-from .epub_extract import extract_epub, EpubExtractError
+from .encode_segments import encode_one, safe_name
+from .epub_extract import EpubExtractError, extract_epub
 
 STAGES = ("extract", "align", "encode", "assemble", "deliver", "done")
 _MAX_LOG_LINES = 50
 
-ProgressCB = Optional[Callable[[str], None]]
+ProgressCB = Callable[[str], None] | None
 
 
 def slugify(s: str) -> str:
@@ -82,24 +84,28 @@ class PipelineConfig:
     intro_max_len: float = 300.0
     detect_outro: bool = False
     outro_max_tail: float = 300.0
+    cover_override: Path | None = None
 
     def to_dict(self) -> dict:
         d = dict(self.__dict__)
         d["mp3"] = str(self.mp3)
         d["epub"] = str(self.epub)
         d["out_dir"] = str(self.out_dir)
+        d["cover_override"] = str(self.cover_override) if self.cover_override else None
         return d
 
     @classmethod
-    def from_dict(cls, d: dict) -> "PipelineConfig":
+    def from_dict(cls, d: dict) -> PipelineConfig:
         d = dict(d)
         d["mp3"] = Path(d["mp3"])
         d["epub"] = Path(d["epub"])
         d["out_dir"] = Path(d["out_dir"])
+        d["cover_override"] = Path(d["cover_override"]) if d.get("cover_override") else None
         return cls(**d)
 
     @staticmethod
-    def validate_new(mp3: Path, epub: Path, out_dir: Path) -> None:
+    def validate_new(mp3: Path, epub: Path, out_dir: Path,
+                      cover_override: Path | None = None) -> None:
         """Raise PipelineError with an actionable message if the inputs
         can't plausibly be processed. Called before a job is created."""
         check_ffmpeg_available()
@@ -122,6 +128,16 @@ class PipelineConfig:
             out_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             raise PipelineError(f"Can't create output directory {out_dir}: {e}") from e
+        if cover_override is not None:
+            if not cover_override.exists():
+                raise PipelineError(f"Cover image not found: {cover_override}")
+            if not cover_override.is_file():
+                raise PipelineError(f"Cover image path is not a file: {cover_override}")
+            if cover_override.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+                raise PipelineError(
+                    f"Expected a .jpg/.jpeg/.png cover image, got {cover_override.suffix!r} "
+                    f"({cover_override})."
+                )
 
 
 class Pipeline:
@@ -150,7 +166,7 @@ class Pipeline:
             cb(msg)
 
     @classmethod
-    def load_existing(cls, work_dir: Path) -> "Pipeline":
+    def load_existing(cls, work_dir: Path) -> Pipeline:
         state_path = work_dir / "state.json"
         if not state_path.exists():
             raise PipelineError(f"No job state found at {work_dir}")
@@ -164,6 +180,10 @@ class Pipeline:
             result = extract_epub(self.config.epub, self.work_dir / "epub")
         except EpubExtractError as e:
             raise PipelineError(str(e)) from e
+        cover_note = "yes" if result["cover"] else "no"
+        if self.config.cover_override:
+            result["cover"] = str(self.config.cover_override)
+            cover_note = "override"
         self.state["epub"] = result
         self.state["mp3_duration"] = ffprobe_duration(self.config.mp3)
         self.state["stage"] = "align"
@@ -172,7 +192,7 @@ class Pipeline:
         self._save()
         self._log(
             f"extracted: {result['meta']['title']} by {result['meta']['author']}, "
-            f"{len(result['chapters'])} chapters, cover={'yes' if result['cover'] else 'no'}",
+            f"{len(result['chapters'])} chapters, cover={cover_note}",
             cb,
         )
         return True
@@ -379,7 +399,8 @@ class Pipeline:
             lines.append(f"episode_id={meta['series_index']}")
         cum = 0.0
         for s, d in zip(segments, durs):
-            title = s["title"].replace("\\", "\\\\").replace("=", "\\=").replace(";", "\\;").replace("#", "\\#")
+            title = (s["title"].replace("\\", "\\\\").replace("=", "\\=")
+                     .replace(";", "\\;").replace("#", "\\#"))
             lines += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={int(cum * 1000)}",
                       f"END={int((cum + d) * 1000)}", f"title={title}"]
             cum += d
