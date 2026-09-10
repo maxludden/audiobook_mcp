@@ -46,6 +46,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 USER_AGENT = "audiobook-mcp/0.1 (personal research tool; https://github.com/)"
 MIN_INTERVAL_SECONDS = 1.5  # soft per-process throttle across all lookup calls
@@ -77,6 +78,13 @@ def _get_json(url: str, timeout: float = 15.0) -> dict:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.URLError as e:
         raise MetadataLookupError(f"Request to {url.split('?')[0]} failed: {e}") from e
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        # A source occasionally answers 200 with something that isn't
+        # valid JSON (an HTML error/maintenance page, truncated body,
+        # unexpected encoding). Wrap it the same way as a network failure
+        # so every caller of this helper -- including _query_one_source's
+        # "never raises" contract -- only has one exception type to catch.
+        raise MetadataLookupError(f"Request to {url.split('?')[0]} returned unparseable data: {e}") from e
 
 
 def query_google_books(title: str, author: str | None, api_key: str | None) -> list:
@@ -358,27 +366,50 @@ def reconcile(out: dict, title: str) -> dict:
 # ------------------------------------------------------------- entry point
 
 
+def _query_one_source(name: str, title: str, author: str | None,
+                       google_api_key: str | None) -> tuple[str, list | None, str | None]:
+    """Run one named source's query and return (name, results, error) --
+    never raises, so it's safe to fan out across a thread pool without one
+    source's failure cancelling the others."""
+    try:
+        return name, SOURCES[name](title, author, google_api_key=google_api_key), None
+    except urllib.error.HTTPError as e:
+        msg = f"HTTP {e.code}: {e.reason}"
+        if name == "google" and e.code == 429:
+            msg += (" -- Google Books' shared anonymous quota is exhausted globally, "
+                    "not per-caller; retrying will not help. Set a Google Books API key "
+                    "to fix this (see docstring in metadata_fetch.py).")
+        return name, None, msg
+    except MetadataLookupError as e:
+        return name, None, str(e)
+
+
 def lookup_book_metadata(title: str, author: str | None, sources: list[str],
                           reconcile_results: bool, include_covers: bool,
                           google_api_key: str | None) -> dict:
     """Query the requested sources, optionally reconcile into one record
     and/or probe cover candidates for real pixel dimensions. This is the
     one function server.py's tool calls -- everything above is a helper.
+
+    The requested sources (and, below, cover-image probes) are independent
+    network calls with no data dependency on each other, so they're fanned
+    out across a thread pool instead of run one-by-one -- one lookup's
+    total latency is then whichever single source/cover is slowest, not
+    their sum. `_throttle()` still runs exactly once per call regardless,
+    so this doesn't change how often the *shared* per-process rate limit
+    lets a caller reach these APIs -- only how much wall-clock time one
+    already-permitted call takes.
     """
     _throttle()
     out: dict = {}
-    for name in sources:
-        try:
-            out[name] = SOURCES[name](title, author, google_api_key=google_api_key)
-        except urllib.error.HTTPError as e:
-            msg = f"HTTP {e.code}: {e.reason}"
-            if name == "google" and e.code == 429:
-                msg += (" -- Google Books' shared anonymous quota is exhausted globally, "
-                        "not per-caller; retrying will not help. Set a Google Books API key "
-                        "to fix this (see docstring in metadata_fetch.py).")
-            out[f"{name}_error"] = msg
-        except MetadataLookupError as e:
-            out[f"{name}_error"] = str(e)
+    if sources:
+        with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+            for name, data, err in pool.map(
+                    lambda n: _query_one_source(n, title, author, google_api_key), sources):
+                if err is not None:
+                    out[f"{name}_error"] = err
+                else:
+                    out[name] = data
 
     result: dict = {}
     if reconcile_results:
@@ -388,10 +419,13 @@ def lookup_book_metadata(title: str, author: str | None, sources: list[str],
     result["errors"] = {k: v for k, v in out.items() if k.endswith("_error")}
 
     if include_covers:
+        candidates = cover_candidates(out)
         covers = []
-        for c in cover_candidates(out):
-            probed = probe_image(c["url"])
-            probed.pop("_data", None)
-            covers.append({**probed, "source": c["source"]})
+        if candidates:
+            with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+                probed_list = pool.map(lambda c: probe_image(c["url"]), candidates)
+                for candidate, probed in zip(candidates, probed_list):
+                    probed.pop("_data", None)
+                    covers.append({**probed, "source": candidate["source"]})
         result["covers"] = covers
     return result

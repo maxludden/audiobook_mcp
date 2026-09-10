@@ -40,11 +40,13 @@ chapter-announcement sting); `min_gap` filters that out.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
 import time
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,6 +60,21 @@ from .epub_extract import EpubExtractError, extract_epub
 
 STAGES = ("extract", "align", "encode", "assemble", "deliver", "done")
 _MAX_LOG_LINES = 50
+# Rough share of a long book's total wall-clock cost each stage typically
+# takes, used only to compute a single overall_progress fraction for
+# progress bars / ctx.report_progress -- NOT a per-book time estimate.
+# Encode (decoding + re-encoding the entire audio) dominates; extract,
+# align (short silencedetect clips, now parallel-friendly window search),
+# and assemble (stream-copy concat/mux, no re-encode) are comparatively
+# quick; deliver (copying the whole finished file) can be non-trivial on
+# a slow disk or network mount.
+_STAGE_WEIGHTS = {"extract": 0.02, "align": 0.13, "encode": 0.55, "assemble": 0.05, "deliver": 0.25}
+# Segment encodes are independent, single-threaded ffmpeg subprocesses, so
+# running several at once uses more of a multi-core host instead of
+# leaving it idle while one segment encodes at a time. Capped well below
+# "one per core" so a huge core count doesn't turn into dozens of
+# concurrent ffmpeg processes fighting over disk I/O.
+_MAX_ENCODE_WORKERS = 4
 
 ProgressCB = Callable[[str], None] | None
 
@@ -198,7 +215,12 @@ class Pipeline:
         return True
 
     # ------------------------------------------------------------------ align
-    def _find_gap(self, after: float, total_dur: float, first_span=2200.0, max_span=4200.0):
+    def _find_gap(self, after: float, total_dur: float, first_span=2200.0, max_span=8800.0):
+        # max_span must be at least first_span*2 or the "while span <=
+        # max_span" loop below runs exactly once no matter how many times
+        # span doubles -- silently disabling the expanding-window retry
+        # this is meant to provide and sending every chapter longer than
+        # first_span straight to the prev_actual+900s fallback guess.
         span = first_span
         while span <= max_span:
             clip_start = after + 3.0
@@ -340,19 +362,41 @@ class Pipeline:
         seg_dir.mkdir(exist_ok=True)
         segments = self.state["segments"]
         done = set(self.state["encode_progress"])
+        pending = [s for s in segments if s["n"] not in done]
 
+        workers = max(1, min(_MAX_ENCODE_WORKERS, os.cpu_count() or 1, len(pending)))
         t0 = time.monotonic()
-        for seg in segments:
-            if seg["n"] in done:
-                continue
-            if (time.monotonic() - t0) >= budget:
-                break
-            out_path = seg_dir / safe_name(seg["n"], seg["title"])
-            encode_one(self.config.mp3, seg["start"], seg["end"], out_path,
-                       bitrate=self.config.bitrate)
-            done.add(seg["n"])
-            self.state["encode_progress"] = sorted(done)
-            self._save()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            in_flight: dict = {}
+            next_idx = 0
+            while next_idx < len(pending) or in_flight:
+                # Once budget runs out this inner loop stops handing out new
+                # work, but every future already in in_flight still has to
+                # be awaited below before this call can return -- an ffmpeg
+                # subprocess can't be safely killed mid-encode without
+                # risking a corrupt or duplicate-written segment file on the
+                # next resume. Because up to `workers` segments run truly
+                # concurrently (separate OS processes), the wall-clock
+                # overrun this can add is bounded by whichever one of them
+                # is slowest -- not their sum -- the same single-segment
+                # bound the original one-at-a-time version already had.
+                while (next_idx < len(pending) and len(in_flight) < workers
+                       and (time.monotonic() - t0) < budget):
+                    seg = pending[next_idx]
+                    next_idx += 1
+                    out_path = seg_dir / safe_name(seg["n"], seg["title"])
+                    future = pool.submit(encode_one, self.config.mp3, seg["start"], seg["end"],
+                                          out_path, bitrate=self.config.bitrate)
+                    in_flight[future] = seg
+                if not in_flight:
+                    break
+                finished, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    seg = in_flight.pop(future)
+                    future.result()  # re-raise if this segment's encode failed
+                    done.add(seg["n"])
+                self.state["encode_progress"] = sorted(done)
+                self._save()
 
         self._log(f"encode: {len(done)}/{len(segments)} segments", cb)
         if len(done) >= len(segments):
@@ -487,15 +531,49 @@ class Pipeline:
         return self.summarize()
 
     # ------------------------------------------------------------- inspect
+    def _overall_progress(self) -> float:
+        """0.0-1.0 fraction of the *whole job* done so far, combining every
+        completed stage's fixed weight with how far along the current
+        stage's own countable unit of work (chapters aligned, segments
+        encoded, bytes delivered) is. Unlike a per-call elapsed-time ratio,
+        this is comparable across separate continue_conversion/
+        run_until_done calls -- e.g. going from 0.30 to 0.34 always means
+        "4% of the whole job," regardless of how many calls it took."""
+        stage = self.state["stage"]
+        if stage == "done":
+            return 1.0
+        stages_before = STAGES[:STAGES.index(stage)]
+        completed = sum(_STAGE_WEIGHTS[s] for s in stages_before)
+
+        fraction_within = 0.0
+        if stage == "align":
+            align = self.state.get("align")
+            epub = self.state.get("epub")
+            if align and epub and epub["chapters"]:
+                fraction_within = max(0, align["next"] - 1) / len(epub["chapters"])
+        elif stage == "encode":
+            segments = self.state.get("segments")
+            if segments:
+                fraction_within = len(self.state.get("encode_progress", [])) / len(segments)
+        elif stage == "deliver" and self.state.get("assembled_path"):
+            total = Path(self.state["assembled_path"]).stat().st_size
+            if total:
+                fraction_within = self.state.get("deliver_bytes_done", 0) / total
+
+        return round(completed + _STAGE_WEIGHTS[stage] * fraction_within, 4)
+
     def summarize(self) -> dict:
         """Read-only status snapshot -- does no work, safe to call anytime."""
         epub = self.state.get("epub")
         align = self.state.get("align")
         segments = self.state.get("segments")
+        overall_progress = self._overall_progress()
         out = {
             "stage": self.state["stage"],
             "done": self.state["stage"] == "done",
             "status_line": self.state.get("status_line", ""),
+            "overall_progress": overall_progress,
+            "overall_progress_pct": round(overall_progress * 100, 1),
             "book": {
                 "title": epub["meta"]["title"], "author": epub["meta"]["author"],
                 "series": epub["meta"]["series"], "series_index": epub["meta"]["series_index"],
