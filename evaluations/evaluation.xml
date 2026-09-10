@@ -1,0 +1,42 @@
+<evaluation>
+   <qa_pair>
+      <question>Exactly one audiobook conversion job is registered under the output directory /tmp/audiobook_mcp_eval/out. What is that job's id?</question>
+      <answer>fixture_book</answer>
+   </qa_pair>
+   <qa_pair>
+      <question>For the single job registered under output directory /tmp/audiobook_mcp_eval/out, what are the book's title and author, formatted exactly as "Title by Author"?</question>
+      <answer>The Fixture Chronicles by Test Author</answer>
+   </qa_pair>
+   <qa_pair>
+      <question>For that same job, exactly one encoded segment's actual duration deviated by more than 30% from the duration its EPUB word count would predict. What is that segment's title?</question>
+      <answer>The Beginning</answer>
+   </qa_pair>
+   <qa_pair>
+      <question>Using that same flagged segment, subtract its expected duration from its actual duration (both in seconds). What is the result?</question>
+      <answer>3.5</answer>
+   </qa_pair>
+   <qa_pair>
+      <question>The EPUB at /tmp/audiobook_mcp_eval/source/fixture_book.epub has four chapters. What is the word count of whichever chapter has the highest word count?</question>
+      <answer>124</answer>
+   </qa_pair>
+   <qa_pair>
+      <question>What is the combined word count across every chapter in the EPUB at /tmp/audiobook_mcp_eval/source/fixture_book.epub?</question>
+      <answer>324</answer>
+   </qa_pair>
+   <qa_pair>
+      <question>Find the job registered under output directory /tmp/audiobook_mcp_eval/out, get its final output file path, then verify that file against its original source audio at /tmp/audiobook_mcp_eval/source/fixture_book.mp3. What is the reported duration difference in seconds (output duration minus source duration), rounded to 2 decimal places?</question>
+      <answer>-0.01</answer>
+   </qa_pair>
+   <qa_pair>
+      <question>For the job registered under output directory /tmp/audiobook_mcp_eval/out: does the EPUB's cover_found flag agree with its finished M4B's has_cover_art flag? Answer "yes" or "no".</question>
+      <answer>yes</answer>
+   </qa_pair>
+   <qa_pair>
+      <question>For the job registered under output directory /tmp/audiobook_mcp_eval/out, inspect chapter 1's recorded boundary for silence gaps within a 15-second window, using the tool's default noise/min-silence thresholds. Exactly one gap is found -- what is its duration in seconds?</question>
+      <answer>4.0</answer>
+   </qa_pair>
+   <qa_pair>
+      <question>For the job registered under output directory /tmp/audiobook_mcp_eval/out, how many chapters total were flagged as either low-confidence or fallback during alignment (combined count)?</question>
+      <answer>0</answer>
+   </qa_pair>
+</evaluation>

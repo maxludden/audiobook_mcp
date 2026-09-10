@@ -1,0 +1,24 @@
+[project]
+name = "audiobook-mcp"
+version = "0.1.0"
+description = "MCP server that converts a single-file MP3/M4A audiobook + EPUB into a chaptered M4B."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.28,<2.0.0",
+    "pydantic>=2.0,<3.0.0",
+    "beautifulsoup4>=4.12,<5.0.0",
+    "lxml>=5.0,<6.0.0",
+]
+# Non-pip OS dependencies, must be on PATH: ffmpeg/ffprobe (most tools),
+# exiftool (audiobook_embed_cover_metadata only). See README.md.
+
+[project.scripts]
+audiobook-mcp = "audiobook_mcp.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["audiobook_mcp*"]

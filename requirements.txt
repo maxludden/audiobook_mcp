@@ -1,0 +1,15 @@
+# The MCP Python SDK is on major version 2, which renamed FastMCP -> MCPServer
+# and changed parts of the API. This server targets v1.x (the SDK's own
+# recommended version for production use as of this writing); pin below 2
+# until this server is deliberately migrated.
+mcp>=1.28,<2.0.0
+pydantic>=2.0,<3.0.0
+beautifulsoup4>=4.12,<5.0.0
+lxml>=5.0,<6.0.0
+
+# audiobook_mcp/metadata_fetch.py (book/cover metadata lookup) is stdlib-only
+# (urllib) by design -- no extra pip package needed for it.
+#
+# External (non-pip) OS dependencies, must be on PATH:
+#   ffmpeg / ffprobe  -- required by nearly every tool
+#   exiftool          -- required only by audiobook_embed_cover_metadata
