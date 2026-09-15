@@ -10,9 +10,16 @@ chapter transition and anchoring the search for chapter N+1 on chapter
 N's actual detected boundary — not on a bookseller's rounded displayed
 durations (which drift over a long book) or on EPUB word-count pacing
 alone (dialogue-heavy vs. descriptive passages read at different speeds).
-See `audiobook_mcp/pipeline.py`'s module docstring for the full
-rationale, including how it filters out the short "decoy" gap some
-publishers place a few seconds after the real transition.
+Because that chain starts from chapter 1, an unconfirmed guess at chapter
+1's own start (most commonly a missed opening-credits/intro segment) would
+otherwise throw off every chapter behind it — so before the chain runs at
+all, chapter 1's boundary is confirmed by transcribing candidate gaps near
+the start of the file (via whisper.cpp) and checking each against the
+EPUB's own chapter-1 text (`verify_first_chapter`, on by default; falls
+back to a silence-only guess if whisper.cpp isn't configured). See
+`audiobook_mcp/pipeline.py`'s module docstring for the full rationale,
+including how it filters out the short "decoy" gap some publishers place
+a few seconds after the real transition.
 
 ## Why this is a *resumable job*, not one blocking tool call
 
@@ -33,7 +40,22 @@ MCP client is comfortable with."
 Requires Python 3.10+, `ffmpeg`/`ffprobe` on `PATH`.
 `exiftool` is also needed, but only for `audiobook_embed_cover_metadata` --
 every other tool works without it (missing `exiftool` is reported clearly
-by that one tool, not a silent skip).
+by that one tool, not a silent skip). Likewise,
+[`whisper.cpp`](https://github.com/ggerganov/whisper.cpp) is recommended
+but not required: build/install it, put its CLI binary (`whisper-cli` or
+`whisper-cpp`) on `PATH` (or point `AUDIOBOOK_MCP_WHISPER_BIN` at it
+directly), download a GGML model with its `models/download-ggml-model.sh`
+script, and set `AUDIOBOOK_MCP_WHISPER_MODEL` to that model file's path.
+It's used by `audiobook_transcribe_chapter_boundary` (an on-demand spot
+check) and, by default, by `audiobook_start_conversion`'s
+`verify_first_chapter` step (an automatic check of chapter 1's boundary
+before the rest of the book is aligned). Without it, `verify_first_chapter`
+falls back to a silence-only guess and logs a warning instead of failing
+the job -- so whisper.cpp is worth setting up for any book that might have
+an intro, but nothing breaks without it. No Python speech-recognition
+package is installed by this project -- like ffmpeg and exiftool,
+whisper.cpp is shelled out to as an external binary, and a missing
+binary/model is reported clearly rather than silently skipped.
 
 ```bash
 cd audiobook_mcp
@@ -88,6 +110,7 @@ Or, after `pip install -e .`, use the installed console script instead of
 | `audiobook_list_conversions` | List known jobs (paginated). |
 | `audiobook_inspect_chapter_boundary` | List silence gaps found around a chapter's recorded boundary. |
 | `audiobook_render_boundary_waveform` | Render a waveform PNG around a boundary, for a visual spot-check. |
+| `audiobook_transcribe_chapter_boundary` | Transcribe the audio at a boundary via whisper.cpp, for a text-based spot-check. |
 | `audiobook_patch_chapter_boundary` | Manually fix a flagged/fallback chapter boundary. |
 | `audiobook_verify_output` | Sanity-check a finished M4B (chapters, duration, cover art). |
 | `audiobook_cancel_conversion` | Remove a job (optionally deleting its scratch files). |
@@ -96,11 +119,35 @@ Or, after `pip install -e .`, use the installed console script instead of
 | `audiobook_embed_cover_metadata` | Write a metadata record into a cover image's EXIF/XMP/IPTC tags. |
 
 Typical flow: `start_conversion` → loop `run_until_done` (or
-`continue_conversion`) until `done` → if `get_status` shows
-`fallback_chapters` or `word_count_warnings`, use
-`inspect_chapter_boundary` (+ optionally `render_boundary_waveform`) to
-find the right cut, then `patch_chapter_boundary` and resume → finally
-`verify_output` on the result.
+`continue_conversion`) until `done`. The first thing that loop does, before
+aligning any other chapter, is confirm chapter 1's own boundary by
+transcript (`verify_first_chapter`, on by default -- see `get_status`'s
+`alignment.chapter_1_anchor` for its outcome); everything from chapter 2
+onward chains forward from whatever chapter 1's boundary turns out to be,
+so getting it right up front avoids having to patch every later chapter
+individually if it were wrong. Once `done`, if `get_status` still shows
+`fallback_chapters` or `word_count_warnings` for some *other* chapter, use
+`inspect_chapter_boundary` (+ optionally `render_boundary_waveform` for a
+visual check, or `transcribe_chapter_boundary` for a text check against
+the EPUB's own chapter opening) to find the right cut, then
+`patch_chapter_boundary` and resume → finally `verify_output` on the
+result.
+
+```mermaid
+flowchart TD
+    A["start_conversion"] --> V["verify_first_chapter:\ntranscribe candidates near\nfile start vs. EPUB ch.1 text"]
+    V --> B["loop: run_until_done\n(or continue_conversion) --\nchapters 2..N chain forward\nfrom chapter 1's boundary"]
+    B --> C{"done?"}
+    C -- "no" --> B
+    C -- "yes" --> D{"get_status shows\nfallback_chapters or\nword_count_warnings?"}
+    D -- "no" --> G["verify_output"]
+    D -- "yes" --> E["inspect_chapter_boundary"]
+    E --> F1["render_boundary_waveform\n(visual check)"]
+    E --> F2["transcribe_chapter_boundary\n(text check vs. EPUB)"]
+    F1 --> P["patch_chapter_boundary"]
+    F2 --> P
+    P -- "resume" --> B
+```
 
 The last three tools are a mostly-independent workflow (ported from
 the `book-metadata-fetch` skill, see `third_party/book-metadata-fetch/`

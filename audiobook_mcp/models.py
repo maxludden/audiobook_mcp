@@ -64,10 +64,26 @@ class StartConversionInput(BaseModel):
     )
     detect_intro: bool = Field(
         default=False,
-        description="Look for an opening-credits-style segment before chapter 1. Off by default: "
-                    "most books have no intro, and a false positive silently shifts every chapter "
-                    "label by one for the whole book. Only enable if the user has confirmed the "
-                    "book has an audible intro."
+        description="Look for an opening-credits-style segment before chapter 1 using silence "
+                    "timing alone, with no transcript confirmation. Off by default: most books "
+                    "have no intro, and a false positive silently shifts every chapter label by "
+                    "one for the whole book. Only takes effect as a fallback -- when "
+                    "verify_first_chapter is on (the default) and whisper.cpp is available, "
+                    "transcript confirmation decides chapter 1's start instead of this heuristic."
+    )
+    verify_first_chapter: bool = Field(
+        default=True,
+        description="Before aligning any other chapter, transcribe candidate boundaries near the "
+                    "start of the file (via whisper.cpp) and confirm one actually opens with "
+                    "chapter 1's own EPUB text, whatever comes before it (front matter, opening "
+                    "credits, a long preface -- no fixed length assumed). This is what "
+                    "min_gap/detect_intro's chain-forward alignment silently gets wrong when a "
+                    "book has an intro: every later chapter is found by chaining forward from "
+                    "chapter 1's boundary, so an unconfirmed guess there throws off the whole "
+                    "book and requires patching every chapter afterward, not just one. If "
+                    "whisper.cpp isn't configured (see README), this falls back to the old "
+                    "silence-only heuristic (detect_intro or 0.0) and logs a warning instead of "
+                    "failing the job."
     )
     intro_max_len: float = Field(
         default=300.0, ge=10.0, le=1800.0,
@@ -177,6 +193,30 @@ class RenderWaveformInput(BaseModel):
         description="Render around this timestamp instead of the chapter's recorded boundary -- "
                     "useful after audiobook_inspect_chapter_boundary surfaces a candidate gap you "
                     "want to eyeball before patching."
+    )
+
+
+class TranscribeBoundaryInput(BaseModel):
+    """Input for transcribing the audio right after a chapter boundary,
+    via a local whisper.cpp install."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    job_id: str = Field(..., min_length=1, description="Job id returned by audiobook_start_conversion.")
+    chapter_index: int = Field(..., ge=1, description="1-based chapter number to transcribe around.")
+    duration_seconds: float = Field(
+        default=12.0, ge=3.0, le=60.0,
+        description="How much audio, starting at the boundary, to transcribe."
+    )
+    language: str = Field(
+        default="en", min_length=2, max_length=10,
+        description="whisper.cpp language code, e.g. 'en', 'es', 'fr' -- set to the book's actual "
+                    "spoken language, not necessarily its written/EPUB language."
+    )
+    center_override_seconds: float | None = Field(
+        default=None, ge=0.0,
+        description="Transcribe starting at this timestamp instead of the chapter's recorded "
+                    "boundary -- useful after audiobook_inspect_chapter_boundary surfaces a "
+                    "candidate gap you want to check before patching."
     )
 
 

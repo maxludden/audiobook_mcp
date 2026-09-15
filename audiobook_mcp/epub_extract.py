@@ -59,6 +59,10 @@ def extract_epub(epub_path: Path, work_dir: Path) -> dict:
           "cover": str | None,       # absolute path to the best cover image found
           "chapters": [
             {"n": int, "title": str, "word_count": int, "_href": str}, ...
+            # _href is relative to `work_dir` (this call's own extraction
+            # root), not to the OPF file's directory -- join it as
+            # `work_dir / chapter["_href"]` regardless of where inside
+            # the EPUB the content actually lives (e.g. "OEBPS/...").
           ],
         }
 
@@ -90,9 +94,9 @@ def extract_epub(epub_path: Path, work_dir: Path) -> dict:
     meta = _extract_metadata(opf)
     cover_path = _find_cover(opf, manifest, base)
 
-    chapters = _extract_chapters_via_toc(base, manifest, spine)
+    chapters = _extract_chapters_via_toc(base, manifest, spine, work_dir)
     if not chapters:
-        chapters = _extract_chapters_via_blocklist(base, manifest, spine)
+        chapters = _extract_chapters_via_blocklist(base, manifest, spine, work_dir)
     if not chapters:
         raise EpubExtractError(
             f"Could not locate any chapters in {epub_path.name}. The EPUB may use an "
@@ -173,7 +177,23 @@ def _chapter_word_count(path: Path) -> tuple[str, int]:
     return heading, len(text.split())
 
 
-def _extract_chapters_via_toc(base: Path, manifest: dict, spine: list[str]) -> list[dict]:
+def chapter_opening_text(path: Path, n_words: int = 40) -> str:
+    """Return the first n_words of a chapter file's body text, with its
+    own heading (title) excluded -- for comparing against a transcribed
+    audio clip near the chapter's detected boundary. Best-effort: if no
+    h1/h2/h3 heading is found, the full text (however it starts) is used
+    as-is."""
+    soup = BeautifulSoup(_read(path), "lxml")
+    for tag in ["h1", "h2", "h3"]:
+        h = soup.find(tag)
+        if h:
+            h.extract()
+            break
+    text = soup.get_text(" ", strip=True)
+    return " ".join(text.split()[:n_words])
+
+
+def _extract_chapters_via_toc(base: Path, manifest: dict, spine: list[str], root: Path) -> list[dict]:
     toc_ncx = list(base.rglob("*.ncx"))
     nav_html = list(base.rglob("nav.xhtml"))
     entries: list[tuple[str, str]] = []  # (label, href)
@@ -232,14 +252,18 @@ def _extract_chapters_via_toc(base: Path, manifest: dict, spine: list[str]) -> l
             if j > 0 and heading and _is_front_back_matter(heading):
                 break
             wc += w
+        # stored relative to `root` (the epub's extraction directory), not
+        # `base` (the OPF's own directory, e.g. "OEBPS/") -- every caller
+        # (chapter_opening_text lookups in server.py/pipeline.py) joins
+        # this against the extraction root, not the OPF's directory.
         chapters.append({"n": n, "title": title, "word_count": wc,
-                          "_href": spine_hrefs[start_idx]})
+                          "_href": (base / spine_hrefs[start_idx]).relative_to(root).as_posix()})
 
     chapters.sort(key=lambda c: c["n"])
     return chapters
 
 
-def _extract_chapters_via_blocklist(base: Path, manifest: dict, spine: list[str]) -> list[dict]:
+def _extract_chapters_via_blocklist(base: Path, manifest: dict, spine: list[str], root: Path) -> list[dict]:
     chapters = []
     n = 0
     for idref in spine:
@@ -256,5 +280,6 @@ def _extract_chapters_via_blocklist(base: Path, manifest: dict, spine: list[str]
         if wc < 200:  # too short to plausibly be real chapter content
             continue
         n += 1
-        chapters.append({"n": n, "title": heading or f"Chapter {n}", "word_count": wc, "_href": href})
+        chapters.append({"n": n, "title": heading or f"Chapter {n}", "word_count": wc,
+                          "_href": p.relative_to(root).as_posix()})
     return chapters

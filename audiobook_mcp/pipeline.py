@@ -36,6 +36,21 @@ Every step's anchor is ground truth from the audio itself, so a bad
 detection can't drag down the chapters after it. Many audiobooks place a
 short decoy gap a few seconds after the real transition (a beat before a
 chapter-announcement sting); `min_gap` filters that out.
+
+Because every chapter after the first is found by chaining forward from
+chapter 1's own boundary, chapter 1 is the one anchor a bad guess can't be
+contained to -- it silently throws off every chapter behind it, which is
+exactly what a missed or mis-measured intro (opening credits, a publisher
+ident, a lengthy preface -- anything before "real" chapter 1 starts) used
+to do. `Pipeline._verify_first_boundary` (see `stage_align`) closes that
+gap up front: before the forward chain runs at all, it transcribes
+candidate gaps near the start of the file via whisper.cpp and only
+accepts the first one whose transcript actually matches chapter 1's own
+EPUB text, rather than trusting silence timing alone. Getting this right
+before the chain runs -- rather than patching chapter 1 after the fact --
+is what avoids having to then separately patch every chapter after it too
+(`Pipeline.patch_boundary` intentionally does not re-derive chapters
+downstream of the one it patches).
 """
 from __future__ import annotations
 
@@ -50,13 +65,15 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import transcribe
 from .audio_probe import (
+    AudioProbeError,
     check_ffmpeg_available,
     detect_silences,
     ffprobe_duration,
 )
 from .encode_segments import encode_one, safe_name
-from .epub_extract import EpubExtractError, extract_epub
+from .epub_extract import EpubExtractError, chapter_opening_text, extract_epub
 
 STAGES = ("extract", "align", "encode", "assemble", "deliver", "done")
 _MAX_LOG_LINES = 50
@@ -75,12 +92,54 @@ _STAGE_WEIGHTS = {"extract": 0.02, "align": 0.13, "encode": 0.55, "assemble": 0.
 # "one per core" so a huge core count doesn't turn into dozens of
 # concurrent ffmpeg processes fighting over disk I/O.
 _MAX_ENCODE_WORKERS = 4
+# How far into the file to look for chapter 1's real start when verifying
+# it by transcript -- generous on purpose (unlike detect_intro's tight
+# intro_max_len) because a transcript match is its own guardrail against
+# a false positive; there's no need to also cap how long a preface/credits
+# segment is allowed to be.
+_ANCHOR_SEARCH_HORIZON = 2400.0
+# Upper bound on how many candidate gaps get transcribed while looking for
+# chapter 1's real start, so a silence-heavy recording can't turn this
+# into an unbounded number of whisper.cpp calls. Generous on purpose --
+# resumability across continue_conversion calls already absorbs the time
+# cost of a long candidate list, so this is a safety valve against a
+# pathological (near-silent) recording, not a tight budget.
+_MAX_ANCHOR_CANDIDATES = 60
+_ANCHOR_CLIP_SECONDS = 18.0
 
 ProgressCB = Callable[[str], None] | None
 
 
 def slugify(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_")[:80] or "book"
+
+
+def _normalize_words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def _matches_chapter_opening(transcript: str, expected_opening: str, min_words: int = 4) -> bool:
+    """Best-effort check that `transcript` (whisper.cpp output for a
+    candidate chapter-1 boundary) actually begins chapter 1's own text.
+    Not exact matching -- a narrator-spoken "Chapter One" label the
+    EPUB's own text won't contain, and ASR misheard a word or two, are
+    both expected. A high-overlap ordered run of the chapter's first
+    content words appearing in the transcript is enough."""
+    t_words = _normalize_words(transcript)
+    e_words = _normalize_words(expected_opening)
+    if len(e_words) < min_words or not t_words:
+        return False
+    for window_len in range(min(len(e_words), 12), min_words - 1, -1):
+        window = e_words[:window_len]
+        idx = 0
+        hits = 0
+        for w in t_words:
+            if idx < len(window) and w == window[idx]:
+                hits += 1
+                idx += 1
+        if hits / window_len >= 0.7:
+            return True
+    return False
 
 
 class PipelineError(RuntimeError):
@@ -102,6 +161,7 @@ class PipelineConfig:
     detect_outro: bool = False
     outro_max_tail: float = 300.0
     cover_override: Path | None = None
+    verify_first_chapter: bool = True
 
     def to_dict(self) -> dict:
         d = dict(self.__dict__)
@@ -237,6 +297,106 @@ class Pipeline:
             span *= 2
         return None, "fallback"
 
+    # ---------------------------------------------------- anchor verification
+    def _verify_first_boundary(self, budget: float, total_dur: float, cb: ProgressCB = None) -> bool:
+        """Confirm chapter 1's actual start by transcribing candidate
+        gaps near the front of the file (via whisper.cpp) and checking
+        each against the EPUB's own chapter-1 text, instead of guessing
+        from silence timing alone. Every other chapter's boundary is
+        found by chaining forward from this one (see module docstring),
+        so an unconfirmed guess here -- most commonly a missed intro --
+        would silently throw off the whole book, requiring every
+        downstream chapter to be patched individually to fix it.
+
+        Resumable: progress is persisted in align['anchor_check'], and
+        this returns False (meaning "call again") if it needs another
+        pass to finish, since whisper.cpp can be too slow to check every
+        candidate within one budget. Returns True once
+        align['boundaries']['1'] has been set, whether by a confirmed
+        match or by falling back to the pre-transcription heuristic.
+        """
+        align = self.state["align"]
+        check = align.setdefault("anchor_check", {})
+
+        chapters = self.state["epub"]["chapters"]
+        expected = ""
+        if chapters:
+            href_path = self.work_dir / "epub" / chapters[0]["_href"]
+            if href_path.exists():
+                expected = chapter_opening_text(href_path)
+        if not expected:
+            return self._give_up_on_anchor_check(
+                total_dur, "no EPUB text available for chapter 1 to check against", cb)
+
+        if "candidates" not in check:
+            horizon = min(total_dur, _ANCHOR_SEARCH_HORIZON)
+            intervals = detect_silences(self.config.mp3, 0.0, horizon,
+                                         noise_db=-30, min_silence=self.config.min_gap)
+            candidates = [0.0] + [round((s + e) / 2, 3) for s, e in intervals]
+            if len(candidates) > _MAX_ANCHOR_CANDIDATES:
+                self._log(
+                    f"WARNING: {len(candidates)} candidate gaps found in the first "
+                    f"{horizon:.0f}s while looking for chapter 1's boundary -- checking only the "
+                    f"first {_MAX_ANCHOR_CANDIDATES} (earliest first). If chapter 1 still ends up "
+                    "unverified, an unusually pause-heavy intro may be the reason.", cb,
+                )
+            check["candidates"] = candidates[:_MAX_ANCHOR_CANDIDATES]
+            check["tried"] = []
+            check["next_index"] = 0
+            self._save()
+
+        candidates = check["candidates"]
+        t0 = time.monotonic()
+        while check["next_index"] < len(candidates) and (time.monotonic() - t0) < budget:
+            idx = check["next_index"]
+            start = candidates[idx]
+            check["next_index"] = idx + 1
+            out_wav = self.work_dir / "transcripts" / f"anchor_{idx}_{int(start)}.wav"
+            try:
+                transcript = transcribe.transcribe_clip(self.config.mp3, start, _ANCHOR_CLIP_SECONDS, out_wav)
+            except (transcribe.WhisperCppNotFoundError, transcribe.TranscribeError, AudioProbeError) as e:
+                return self._give_up_on_anchor_check(total_dur, f"whisper.cpp unavailable ({e})", cb)
+            matched = _matches_chapter_opening(transcript, expected)
+            check["tried"].append({"start": start, "transcript": transcript, "matched": matched})
+            self._save()
+            if matched:
+                align["boundaries"]["1"] = start
+                check["status"] = "confirmed"
+                self._log(
+                    f"chapter 1 boundary confirmed by transcript at {start:.1f}s "
+                    f"({len(check['tried'])} candidate(s) checked)", cb,
+                )
+                self._save()
+                return True
+
+        if check["next_index"] >= len(candidates):
+            return self._give_up_on_anchor_check(
+                total_dur, f"no candidate matched after {len(candidates)} tried", cb)
+        return False
+
+    def _give_up_on_anchor_check(self, total_dur: float, reason: str, cb: ProgressCB = None) -> bool:
+        """Fall back to the pre-transcription heuristic for chapter 1's
+        boundary (detect_intro's silence-only guess, or 0.0) when
+        transcript verification can't reach a confirmed answer, and log
+        loudly rather than silently proceeding on an unverified guess."""
+        align = self.state["align"]
+        if self.config.detect_intro:
+            fallback, _conf = self._find_gap(0.0, total_dur, first_span=600.0, max_span=600.0)
+            if fallback is None or fallback > self.config.intro_max_len:
+                fallback = 0.0
+        else:
+            fallback = 0.0
+        align["boundaries"]["1"] = fallback
+        align["anchor_check"]["status"] = "unverified"
+        self._log(
+            f"WARNING: couldn't confirm chapter 1's boundary by transcript ({reason}) -- "
+            f"falling back to {fallback:.1f}s. Review with audiobook_inspect_chapter_boundary / "
+            "audiobook_transcribe_chapter_boundary once alignment finishes.",
+            cb,
+        )
+        self._save()
+        return True
+
     def stage_align(self, budget: float, cb: ProgressCB = None) -> bool:
         chapters = self.state["epub"]["chapters"]
         n_chapters = len(chapters)
@@ -244,7 +404,10 @@ class Pipeline:
         align = self.state["align"]
 
         if "1" not in align["boundaries"]:
-            if self.config.detect_intro:
+            if self.config.verify_first_chapter:
+                if not self._verify_first_boundary(budget, total_dur, cb):
+                    return False  # still working through candidates -- resume next call
+            elif self.config.detect_intro:
                 # Only trust this as "end of intro" if it's early (a real
                 # intro/credits segment is short) -- otherwise a book with
                 # no intro at all would have chapter 1's own internal
@@ -253,9 +416,9 @@ class Pipeline:
                 actual, _conf = self._find_gap(0.0, total_dur, first_span=600.0, max_span=600.0)
                 if actual is None or actual > self.config.intro_max_len:
                     actual = 0.0
+                align["boundaries"]["1"] = actual
             else:
-                actual = 0.0
-            align["boundaries"]["1"] = actual
+                align["boundaries"]["1"] = 0.0
             align["next"] = 2
             self._save()
 
@@ -591,6 +754,12 @@ class Pipeline:
                 "manual_overrides": align.get("manual_overrides", []),
                 "outro_detected": bool(align.get("outro_start")),
             }
+            anchor_check = align.get("anchor_check")
+            if anchor_check:
+                out["alignment"]["chapter_1_anchor"] = {
+                    "status": anchor_check.get("status", "pending"),
+                    "candidates_tried": len(anchor_check.get("tried", [])),
+                }
         if segments:
             out["encoding"] = {
                 "segments_encoded": len(self.state.get("encode_progress", [])),
@@ -646,6 +815,12 @@ class Pipeline:
             align["manual_overrides"].append(chapter_index)
         align["low_confidence"] = [c for c in align["low_confidence"] if c != chapter_index]
         align["fallback"] = [c for c in align["fallback"] if c != chapter_index]
+        if chapter_index == 1 and "anchor_check" in align:
+            # a manual patch here means _verify_first_boundary's own
+            # verdict (if any) no longer describes the boundary actually
+            # in effect -- don't leave a stale "confirmed"/"unverified"
+            # status for get_status to report as still current.
+            align["anchor_check"]["status"] = "manually_patched"
 
         invalidated = []
         for key in ("segments", "encode_progress", "assembled_path", "deliver_bytes_done", "final_output"):

@@ -26,7 +26,7 @@ from pathlib import Path
 from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp.types import ToolAnnotations
 
-from . import cover_embed, metadata_fetch
+from . import cover_embed, metadata_fetch, transcribe
 from . import models as m
 from .audio_probe import (
     AudioProbeError,
@@ -34,7 +34,7 @@ from .audio_probe import (
     detect_silences,
     render_waveform_png,
 )
-from .epub_extract import EpubExtractError, extract_epub
+from .epub_extract import EpubExtractError, chapter_opening_text, extract_epub
 from .pipeline import Pipeline, PipelineConfig, PipelineError
 from .registry import Registry, RegistryError
 from .verify import verify_m4b
@@ -55,10 +55,12 @@ def _error(e: Exception) -> str:
     message and, where useful, a hint about which tool to use instead."""
     if isinstance(e, RegistryError):
         return json.dumps({"error": str(e), "error_type": "unknown_job"}, indent=2)
-    if isinstance(e, (FfmpegNotFoundError, cover_embed.ExiftoolNotFoundError)):
+    if isinstance(e, (FfmpegNotFoundError, cover_embed.ExiftoolNotFoundError,
+                       transcribe.WhisperCppNotFoundError)):
         return json.dumps({"error": str(e), "error_type": "dependency_missing"}, indent=2)
     if isinstance(e, (PipelineError, EpubExtractError, AudioProbeError,
-                       metadata_fetch.MetadataLookupError, cover_embed.MetadataEmbedError)):
+                       metadata_fetch.MetadataLookupError, cover_embed.MetadataEmbedError,
+                       transcribe.TranscribeError)):
         return json.dumps({"error": str(e), "error_type": type(e).__name__}, indent=2)
     return json.dumps({"error": f"Unexpected error: {e}", "error_type": type(e).__name__}, indent=2)
 
@@ -155,9 +157,19 @@ async def audiobook_start_conversion(params: m.StartConversionInput, ctx: Contex
             - cover_image_path (Optional[str]): use this image instead of
               the EPUB's own cover. Typical flow: audiobook_lookup_book_metadata
               -> audiobook_fetch_cover_image -> pass the downloaded path here.
+            - verify_first_chapter (bool): on by default. Confirms
+              chapter 1's actual start via whisper.cpp transcription
+              *before* any other chapter is aligned, since every later
+              chapter is chained forward from it -- an unconfirmed guess
+              there (typically a missed intro) otherwise throws off the
+              whole book. Falls back to the old silence-only heuristic
+              and logs a warning if whisper.cpp isn't configured; never
+              fails the job.
             - detect_intro/detect_outro (bool): off by default; only turn
               on if the user has confirmed the book has an audible
               intro/outro segment (see tool description in code for why).
+              detect_intro only takes effect as verify_first_chapter's
+              fallback -- see its own field description.
 
     Returns:
         str: JSON with schema:
@@ -192,6 +204,7 @@ async def audiobook_start_conversion(params: m.StartConversionInput, ctx: Contex
             outro_max_search=params.outro_max_search, detect_intro=params.detect_intro,
             intro_max_len=params.intro_max_len, detect_outro=params.detect_outro,
             outro_max_tail=params.outro_max_tail, cover_override=cover_override,
+            verify_first_chapter=params.verify_first_chapter,
         )
         pipeline = Pipeline(config, work_dir)
 
@@ -561,6 +574,99 @@ async def audiobook_render_boundary_waveform(params: m.RenderWaveformInput) -> I
         render_waveform_png, pipeline.config.mp3, center, params.half_window_seconds, out_path,
     )
     return Image(data=out_path.read_bytes(), format="png")
+
+
+# -------------------------------------------------------- transcribe_chapter_boundary
+@mcp.tool(
+    name="audiobook_transcribe_chapter_boundary",
+    title="Transcribe the audio right after a chapter boundary",
+    annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=False,
+        idempotent_hint=True, open_world_hint=False,
+    ),
+)
+async def audiobook_transcribe_chapter_boundary(params: m.TranscribeBoundaryInput) -> str:
+    """Transcribe a few seconds of audio starting at a chapter's current
+    recorded boundary (or center_override_seconds, e.g. a candidate gap
+    surfaced by audiobook_inspect_chapter_boundary) via a local
+    whisper.cpp install -- a text-based alternative/complement to
+    audiobook_render_boundary_waveform for judging a low_confidence or
+    fallback boundary. Compare the transcript against
+    expected_opening_text (pulled straight from the EPUB's own chapter
+    text): a rough match means the cut is clean; a transcript that trails
+    off from the PREVIOUS chapter's content means the boundary landed too
+    late; one missing this chapter's first words means it landed too
+    early.
+
+    Requires whisper.cpp (https://github.com/ggerganov/whisper.cpp) on
+    PATH as `whisper-cli` or `whisper-cpp` (or AUDIOBOOK_MCP_WHISPER_BIN
+    pointing at its CLI binary directly), plus a downloaded GGML model
+    file referenced by AUDIOBOOK_MCP_WHISPER_MODEL -- no Python
+    speech-recognition dependency. Missing either is reported clearly,
+    not silently skipped.
+
+    Args:
+        params (TranscribeBoundaryInput):
+            - job_id (str), chapter_index (int, 1-based).
+            - duration_seconds (float): how much audio to transcribe,
+              starting at the boundary (default 12).
+            - language (str): whisper.cpp language code (default "en") --
+              set to the book's actual spoken language.
+            - center_override_seconds (Optional[float]): transcribe
+              starting here instead of the recorded boundary.
+
+    Returns:
+        str: JSON with schema:
+        {
+          "chapter_index": int,
+          "start_seconds": float,
+          "duration_seconds": float,
+          "transcript": str,                      # "" if the clip is silent/inaudible
+          "expected_opening_text": str | absent    # first ~40 words of this chapter's
+                                                      # own EPUB text, if available
+        }
+        or {"error": str, "error_type": str} on failure.
+
+    Error Handling:
+        - "dependency_missing" if ffmpeg or whisper.cpp (binary or model)
+          aren't available -- see the tool description for setup.
+        - Raises a clear error if chapter_index hasn't been aligned yet
+          and no center_override_seconds was given.
+    """
+    try:
+        pipeline = _pipeline_for(params.job_id)
+        start = params.center_override_seconds
+        if start is None:
+            align = pipeline.state.get("align")
+            if not align or str(params.chapter_index) not in align.get("boundaries", {}):
+                raise PipelineError(
+                    f"Chapter {params.chapter_index} hasn't been aligned yet, and no "
+                    "center_override_seconds was given. Check audiobook_get_status's "
+                    "'alignment.chapters_aligned' first, or pass an explicit timestamp."
+                )
+            start = align["boundaries"][str(params.chapter_index)]
+
+        out_wav = (pipeline.work_dir / "transcripts" /
+                   f"ch{params.chapter_index:03d}_{int(start)}.wav")
+        transcript = await asyncio.to_thread(
+            transcribe.transcribe_clip, pipeline.config.mp3, start, params.duration_seconds,
+            out_wav, params.language,
+        )
+        result = {
+            "chapter_index": params.chapter_index,
+            "start_seconds": round(start, 3),
+            "duration_seconds": params.duration_seconds,
+            "transcript": transcript,
+        }
+        chapters = pipeline.state.get("epub", {}).get("chapters", [])
+        chapter = next((c for c in chapters if c["n"] == params.chapter_index), None)
+        if chapter and chapter.get("_href"):
+            href_path = pipeline.work_dir / "epub" / chapter["_href"]
+            if href_path.exists():
+                result["expected_opening_text"] = chapter_opening_text(href_path)
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return _error(e)
 
 
 # ------------------------------------------------------------------- patch_chapter_boundary
