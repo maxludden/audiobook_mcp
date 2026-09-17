@@ -8,7 +8,7 @@ dependencies = [
     "mcp>=2.0,<3.0.0",
     "pydantic>=2.0,<3.0.0",
     "beautifulsoup4>=4.12,<5.0.0",
-    "lxml>=5.0,<6.0.0",
+    "lxml>=5.0,<7.0.0",
 ]
 # Non-pip OS dependencies, must be on PATH: ffmpeg/ffprobe (most tools),
 # exiftool (audiobook_embed_cover_metadata only). See README.md.
@@ -18,7 +18,7 @@ audiobook-mcp = "audiobook_mcp.server:main"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0,<9.0",
+    "pytest>=8.0,<10.0",
     "ruff>=0.6,<1.0",
     "mypy>=1.10,<2.0",
 ]
